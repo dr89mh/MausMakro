@@ -14,6 +14,7 @@ Im Gegensatz zu Glorious Core kann MausMakro **mehrere Maustasten gleichzeitig g
 
 - Schritte: **Maustasten** (Links, Rechts, Mitte, Zurück, Vor – beliebig kombiniert), **Taste antippen**,
   **Taste drücken**, **Taste loslassen**, **Warten**
+- **Aufnahme:** Tasten und Maustasten einfach vormachen – mit echten Pausen, auch in anderen Fenstern
 - Tasten per Tastendruck aufnehmen oder aus einer Liste wählen (inkl. Strg, Umschalt, Alt, Win, Ziffernblock)
 - Modus je Makro: **Einmal abspielen**, **Wiederholen, solange die Taste gedrückt ist**, **An/Aus**
 - Belegbare Tasten: vordere Seitentaste, hintere Seitentaste, Mausrad-Klick, DPI-Taste
@@ -46,6 +47,31 @@ Der Quelltext ist deshalb bewusst C# 5 und steckt komplett in `MausMakro.cs`.
    - Warten: 150 ms
 3. **Modus** und **Taste** wählen.
 4. **Dieses Makro auf die Maus schreiben** klicken.
+
+### Aufnehmen
+
+Statt Schritte einzeln hinzuzufügen, kann man sie auch vormachen:
+
+1. Rechts auf **● Aufnehmen** klicken.
+2. Tasten und Maustasten drücken – das funktioniert auch, während ein anderes Fenster im Vordergrund ist.
+   Gleichzeitig gedrückte Maustasten (z. B. Links + Rechts) werden als Kombination erkannt.
+3. Mit **F12** (oder einem Klick auf **■ Stopp**) beenden.
+4. Im folgenden Fenster wählen, ob die Pausen genau übernommen, auf 50 ms gerundet oder alle gleich lang
+   werden sollen – und ob die Aufnahme eingefügt, das Makro ersetzt oder ein neues Makro angelegt wird.
+
+![Aufnahme übernehmen](docs/aufnahme.png)
+
+Danach steht die Aufnahme als normale Schrittliste da und kann bearbeitet werden. Kurzes Drücken und
+Loslassen einer Taste wird automatisch zu „Taste antippen“ zusammengefasst.
+
+Gut zu wissen:
+- **Mausbewegungen und Mausrad** werden nicht aufgenommen – die Maus-Firmware kennt in Makros nur Tasten und Pausen.
+- Auch Klicks oder Alt+Tab zum Fensterwechsel landen in der Aufnahme; solche Schritte danach einfach löschen.
+- Läuft ein Spiel mit Administratorrechten, sieht MausMakro dessen Eingaben eventuell nicht.
+  Am sichersten außerhalb des Spiels aufnehmen (z. B. auf dem Desktop).
+- Künstlich erzeugte Eingaben (z. B. von AutoHotkey) werden ignoriert.
+
+### Was beim Abspielen passiert
 
 Am Ende jedes Durchlaufs lässt MausMakro automatisch alle noch gedrückten Tasten los – sonst blieben sie nach
 dem Ausschalten des Makros hängen. Im Modus *An/Aus* stoppt das Makro nach dem laufenden Durchlauf.

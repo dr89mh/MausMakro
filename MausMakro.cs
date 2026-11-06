@@ -834,10 +834,15 @@ namespace MausMakro
         TableLayoutPanel editor;
         readonly List<Control> mouseControls = new List<Control>();
         readonly System.Windows.Forms.Timer deviceTimer = new System.Windows.Forms.Timer { Interval = 3000 };
+        readonly System.Windows.Forms.Timer recordTimer = new System.Windows.Forms.Timer { Interval = 250 };
+        Recorder recorder;
+        Button btnRecord;
+
+        public const string Version = "1.1";
 
         public MainForm()
         {
-            Text = "MausMakro – Glorious Model D Wireless";
+            Text = "MausMakro " + Version + " – Glorious Model D Wireless";
             Font = SystemFonts.MessageBoxFont;
             AutoScaleMode = AutoScaleMode.None;
             StartPosition = FormStartPosition.CenterScreen;
@@ -982,6 +987,15 @@ namespace MausMakro
                 WrapContents = false,
                 Margin = new Padding(Ui.S(8), 0, 0, 0)
             };
+            btnRecord = StepButton("● Aufnehmen", (s, e) => ToggleRecording());
+            btnRecord.Font = new Font(Font, FontStyle.Bold);
+            stepButtons.Controls.Add(btnRecord);
+            recordTimer.Tick += (s, e) =>
+            {
+                if (recorder != null)
+                    lblInfo.Text = "● Aufnahme läuft – " + recorder.Count + " Ereignisse aufgenommen. Beenden mit F12 oder „Stopp“.";
+            };
+            stepButtons.Controls.Add(new Label { Height = Ui.S(8), AutoSize = false });
             stepButtons.Controls.Add(StepButton("+ Maustasten …", (s, e) => AddStep(StepKind.Mouse)));
             stepButtons.Controls.Add(StepButton("+ Taste antippen …", (s, e) => AddStep(StepKind.KeyTap)));
             stepButtons.Controls.Add(StepButton("+ Taste drücken …", (s, e) => AddStep(StepKind.KeyDown)));
@@ -1586,6 +1600,101 @@ namespace MausMakro
             }
         }
 
+        // ------------------------------------------------------------- Aufnahme
+
+        void ToggleRecording()
+        {
+            if (recorder == null)
+                StartRecording();
+            else
+                StopRecording(true);
+        }
+
+        void StartRecording()
+        {
+            if (current == null) return;
+            var rec = new Recorder();
+            rec.StopRequested += () => BeginInvoke(new Action(() => StopRecording(false)));
+            try
+            {
+                rec.Start();
+            }
+            catch (Exception ex)
+            {
+                Log("Aufnahme konnte nicht gestartet werden: " + ex.Message);
+                return;
+            }
+            recorder = rec;
+            btnRecord.Text = "■ Stopp (F12)";
+            btnRecord.ForeColor = Color.Firebrick;
+            recordTimer.Start();
+            Log("Aufnahme läuft – jetzt Tasten und Maustasten drücken (auch in anderen Fenstern). "
+                + "F12 oder „Stopp“ beendet die Aufnahme. Mausbewegungen und Mausrad werden nicht aufgenommen.");
+        }
+
+        void StopRecording(bool byButton)
+        {
+            if (recorder == null) return;
+            // Wurde per Klick auf „Stopp“ beendet, gehört dieser letzte Linksklick nicht zur Aufnahme.
+            var events = recorder.Stop(byButton);
+            recorder = null;
+            recordTimer.Stop();
+            btnRecord.Text = "● Aufnehmen";
+            btnRecord.ForeColor = SystemColors.ControlText;
+            UpdateInfo();
+
+            if (events.Count == 0)
+            {
+                Log("Aufnahme beendet – es wurde nichts aufgenommen.");
+                return;
+            }
+            using (var dialog = new RecordDialog(events, current != null))
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK)
+                {
+                    Log("Aufnahme verworfen.");
+                    return;
+                }
+                ApplyRecording(dialog.Result, dialog.Target);
+            }
+        }
+
+        void ApplyRecording(List<Step> steps, RecordTarget target)
+        {
+            if (target == RecordTarget.NewMacro || current == null)
+            {
+                var macro = new MacroDef { Name = "Aufnahme " + DateTime.Now.ToString("HH:mm"), Mode = MacroMode.Once };
+                macro.Steps.AddRange(steps);
+                AddMacro(macro);
+            }
+            else if (target == RecordTarget.Replace)
+            {
+                current.Steps.Clear();
+                current.Steps.AddRange(steps);
+                Save();
+                RefreshSteps(-1);
+            }
+            else
+            {
+                var selected = SelectedStepIndices();
+                int insertAt = selected.Count > 0 ? selected.Last() + 1 : current.Steps.Count;
+                current.Steps.InsertRange(insertAt, steps);
+                Save();
+                RefreshSteps(insertAt);
+            }
+            Log("Aufnahme übernommen: " + steps.Count + " Schritte.");
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (recorder != null)
+            {
+                recorder.Stop(false);
+                recorder = null;
+            }
+            base.OnFormClosing(e);
+        }
+
         void SetBusy(bool value)
         {
             busy = value;
@@ -1602,6 +1711,396 @@ namespace MausMakro
                 return;
             }
             txtLog.AppendText(DateTime.Now.ToString("HH:mm:ss") + "  " + text + Environment.NewLine);
+        }
+    }
+
+    // ===================================================================== Aufnahme
+
+    public sealed class RecordedEvent
+    {
+        public uint Time;       // Millisekunden (Systemzeit des Ereignisses)
+        public StepKind Kind;   // KeyDown, KeyUp oder Mouse
+        public int Key;         // HID-Usage
+        public int Mask;        // Maustasten-Zustand nach dem Ereignis
+    }
+
+    // Zeichnet Tastatur und Maustasten systemweit über Low-Level-Hooks auf. Künstlich erzeugte Eingaben
+    // (SendInput) werden ignoriert, Mausbewegungen und Mausrad ebenfalls. F12 beendet die Aufnahme.
+    sealed class Recorder
+    {
+        const int WH_KEYBOARD_LL = 13, WH_MOUSE_LL = 14;
+        const uint LLKHF_EXTENDED = 0x01, LLKHF_INJECTED = 0x10, LLKHF_UP = 0x80, LLMHF_INJECTED = 0x01;
+        public const int StopVirtualKey = 0x7B; // F12
+
+        readonly List<RecordedEvent> events = new List<RecordedEvent>();
+        readonly HashSet<int> keysDown = new HashSet<int>();
+        readonly HookProc keyboardProc, mouseProc; // Referenzen halten, sonst sammelt der GC die Delegates ein
+        IntPtr keyboardHook, mouseHook;
+        int mask;
+        int lastLeftDown = -1;
+
+        public event Action StopRequested;
+
+        public Recorder()
+        {
+            keyboardProc = KeyboardHook;
+            mouseProc = MouseHook;
+        }
+
+        public int Count { get { return events.Count; } }
+
+        public void Start()
+        {
+            IntPtr module = GetModuleHandle(null);
+            keyboardHook = SetWindowsHookEx(WH_KEYBOARD_LL, keyboardProc, module, 0);
+            if (keyboardHook == IntPtr.Zero)
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            mouseHook = SetWindowsHookEx(WH_MOUSE_LL, mouseProc, module, 0);
+            if (mouseHook == IntPtr.Zero)
+            {
+                int error = Marshal.GetLastWin32Error();
+                Unhook();
+                throw new Win32Exception(error);
+            }
+        }
+
+        public List<RecordedEvent> Stop(bool dropLastLeftClick)
+        {
+            Unhook();
+            if (dropLastLeftClick && lastLeftDown >= 0 && lastLeftDown < events.Count)
+                events.RemoveRange(lastLeftDown, events.Count - lastLeftDown);
+            return events;
+        }
+
+        void Unhook()
+        {
+            if (keyboardHook != IntPtr.Zero) UnhookWindowsHookEx(keyboardHook);
+            if (mouseHook != IntPtr.Zero) UnhookWindowsHookEx(mouseHook);
+            keyboardHook = mouseHook = IntPtr.Zero;
+        }
+
+        // Gibt true zurück, wenn die Taste verschluckt werden soll (Stopp-Taste).
+        internal bool OnKey(int virtualKey, int scanCode, bool extended, bool up, bool injected, uint time)
+        {
+            if (virtualKey == StopVirtualKey)
+            {
+                if (!up)
+                {
+                    var handler = StopRequested;
+                    if (handler != null)
+                        handler();
+                }
+                return true;
+            }
+            if (injected)
+                return false;
+            // Der von Alt Gr zusätzlich erzeugte Strg-Druck hat Scancode 0x21D und wird hier nicht gefunden.
+            var key = KeyTable.ByScan(scanCode, extended);
+            if (key == null)
+                return false;
+            if (up)
+            {
+                if (keysDown.Remove(key.Hid))
+                    events.Add(new RecordedEvent { Time = time, Kind = StepKind.KeyUp, Key = key.Hid, Mask = mask });
+            }
+            else if (keysDown.Add(key.Hid)) // gedrückt gehaltene Tasten wiederholen KeyDown – nur das erste zählt
+            {
+                events.Add(new RecordedEvent { Time = time, Kind = StepKind.KeyDown, Key = key.Hid, Mask = mask });
+            }
+            return false;
+        }
+
+        internal void OnMouse(int message, uint mouseData, bool injected, uint time)
+        {
+            if (injected)
+                return;
+            int bit;
+            bool down;
+            switch (message)
+            {
+                case 0x201: bit = 1; down = true; break;   // WM_LBUTTONDOWN
+                case 0x202: bit = 1; down = false; break;
+                case 0x204: bit = 2; down = true; break;   // WM_RBUTTONDOWN
+                case 0x205: bit = 2; down = false; break;
+                case 0x207: bit = 4; down = true; break;   // WM_MBUTTONDOWN
+                case 0x208: bit = 4; down = false; break;
+                case 0x20B:                                // WM_XBUTTONDOWN
+                case 0x20C:
+                    int x = (int)(mouseData >> 16);
+                    bit = x == 1 ? 8 : x == 2 ? 16 : 0;
+                    down = message == 0x20B;
+                    break;
+                default:
+                    return;
+            }
+            if (bit == 0)
+                return;
+            int newMask = down ? mask | bit : mask & ~bit;
+            if (newMask == mask)
+                return;
+            mask = newMask;
+            if (bit == 1 && down)
+                lastLeftDown = events.Count;
+            events.Add(new RecordedEvent { Time = time, Kind = StepKind.Mouse, Mask = mask });
+        }
+
+        IntPtr KeyboardHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0)
+            {
+                var info = (KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(KBDLLHOOKSTRUCT));
+                bool swallow = OnKey((int)info.vkCode, (int)info.scanCode, (info.flags & LLKHF_EXTENDED) != 0,
+                    (info.flags & LLKHF_UP) != 0, (info.flags & LLKHF_INJECTED) != 0, info.time);
+                if (swallow)
+                    return new IntPtr(1);
+            }
+            return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        IntPtr MouseHook(int code, IntPtr wParam, IntPtr lParam)
+        {
+            if (code >= 0)
+            {
+                var info = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                OnMouse(wParam.ToInt32(), info.mouseData, (info.flags & LLMHF_INJECTED) != 0, info.time);
+            }
+            return CallNextHookEx(IntPtr.Zero, code, wParam, lParam);
+        }
+
+        delegate IntPtr HookProc(int code, IntPtr wParam, IntPtr lParam);
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct KBDLLHOOKSTRUCT
+        {
+            public uint vkCode, scanCode, flags, time;
+            public IntPtr extraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct MSLLHOOKSTRUCT
+        {
+            public int x, y;
+            public uint mouseData, flags, time;
+            public IntPtr extraInfo;
+        }
+
+        [DllImport("user32.dll", SetLastError = true)]
+        static extern IntPtr SetWindowsHookEx(int idHook, HookProc proc, IntPtr module, uint threadId);
+        [DllImport("user32.dll")]
+        static extern bool UnhookWindowsHookEx(IntPtr hook);
+        [DllImport("user32.dll")]
+        static extern IntPtr CallNextHookEx(IntPtr hook, int code, IntPtr wParam, IntPtr lParam);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr GetModuleHandle(string name);
+    }
+
+    public enum PauseMode { AsRecorded = 0, Rounded = 1, Fixed = 2 }
+    public enum RecordTarget { Insert = 0, Replace = 1, NewMacro = 2 }
+
+    static class RecordConverter
+    {
+        const int MaxWaitPerStep = 60000;
+        const int MaxTapMs = 10000;
+
+        public static List<Step> ToSteps(List<RecordedEvent> events, PauseMode pauses, int fixedMs)
+        {
+            var steps = new List<Step>();
+            for (int i = 0; i < events.Count; i++)
+            {
+                var e = events[i];
+                if (i > 0)
+                {
+                    int delta = unchecked((int)(e.Time - events[i - 1].Time));
+                    if (delta > 0)
+                        steps.Add(new Step { Kind = StepKind.Wait, Ms = delta });
+                }
+                if (e.Kind == StepKind.Mouse)
+                    steps.Add(new Step { Kind = StepKind.Mouse, Mask = e.Mask });
+                else
+                    steps.Add(new Step { Kind = e.Kind, Key = e.Key });
+            }
+
+            // Drücken + (Warten) + Loslassen derselben Taste → „Taste antippen“
+            for (int i = 0; i < steps.Count; i++)
+            {
+                if (steps[i].Kind != StepKind.KeyDown)
+                    continue;
+                int key = steps[i].Key;
+                if (i + 1 < steps.Count && steps[i + 1].Kind == StepKind.KeyUp && steps[i + 1].Key == key)
+                {
+                    steps[i] = new Step { Kind = StepKind.KeyTap, Key = key, Ms = MacroCompiler.MinTapMs };
+                    steps.RemoveAt(i + 1);
+                }
+                else if (i + 2 < steps.Count && steps[i + 1].Kind == StepKind.Wait && steps[i + 1].Ms <= MaxTapMs
+                         && steps[i + 2].Kind == StepKind.KeyUp && steps[i + 2].Key == key)
+                {
+                    steps[i] = new Step { Kind = StepKind.KeyTap, Key = key, Ms = Math.Max(MacroCompiler.MinTapMs, steps[i + 1].Ms) };
+                    steps.RemoveRange(i + 1, 2);
+                }
+            }
+
+            var result = new List<Step>();
+            foreach (var step in steps)
+            {
+                if (step.Kind == StepKind.KeyTap && pauses != PauseMode.AsRecorded)
+                    step.Ms = Math.Max(MacroCompiler.MinTapMs, RoundTo(step.Ms, 10));
+                if (step.Kind != StepKind.Wait)
+                {
+                    result.Add(step);
+                    continue;
+                }
+                int ms = step.Ms;
+                if (pauses == PauseMode.Rounded) ms = RoundTo(ms, 50);
+                else if (pauses == PauseMode.Fixed) ms = fixedMs;
+                while (ms > 0)
+                {
+                    int chunk = Math.Min(ms, MaxWaitPerStep);
+                    result.Add(new Step { Kind = StepKind.Wait, Ms = chunk });
+                    ms -= chunk;
+                }
+            }
+            return result;
+        }
+
+        static int RoundTo(int value, int step)
+        {
+            return (int)Math.Round(value / (double)step, MidpointRounding.AwayFromZero) * step;
+        }
+    }
+
+    sealed class RecordDialog : Form
+    {
+        readonly List<RecordedEvent> events;
+        readonly RadioButton optAsRecorded, optRounded, optFixed, optInsert, optReplace, optNew;
+        readonly NumericUpDown fixedMs;
+        readonly Label preview;
+
+        public List<Step> Result { get; private set; }
+        public RecordTarget Target { get; private set; }
+
+        public RecordDialog(List<RecordedEvent> events, bool hasMacro)
+        {
+            this.events = events;
+            Text = "Aufnahme übernehmen";
+            Font = SystemFonts.MessageBoxFont;
+            AutoScaleMode = AutoScaleMode.None;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            ShowInTaskbar = false;
+            StartPosition = FormStartPosition.CenterParent;
+
+            int margin = Ui.S(14);
+            var table = new TableLayoutPanel { AutoSize = true, ColumnCount = 1, Location = new Point(margin, margin) };
+            int duration = unchecked((int)(events[events.Count - 1].Time - events[0].Time));
+            table.Controls.Add(new Label
+            {
+                Text = events.Count + " Ereignisse aufgenommen, Dauer " + Texts.Duration(Math.Max(0, duration)) + ".",
+                AutoSize = true,
+                Font = new Font(Font, FontStyle.Bold),
+                Margin = new Padding(Ui.S(3), Ui.S(3), Ui.S(3), Ui.S(10))
+            });
+
+            table.Controls.Add(SectionLabel("Pausen zwischen den Schritten:"));
+            optAsRecorded = Radio("genau wie aufgenommen", true);
+            optRounded = Radio("auf 50 ms runden (übersichtlicher)", false);
+            optFixed = Radio("alle gleich lang:", false);
+            fixedMs = new NumericUpDown { Minimum = 1, Maximum = 60000, Value = 100, Increment = 50, Width = Ui.S(90), ThousandsSeparator = true };
+            var fixedRow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = new Padding(0) };
+            fixedRow.Controls.Add(optFixed);
+            fixedRow.Controls.Add(fixedMs);
+            fixedRow.Controls.Add(new Label { Text = "ms", AutoSize = true, Anchor = AnchorStyles.Left, Margin = new Padding(Ui.S(4), Ui.S(3), 0, 0) });
+            var pausePanel = Group(optAsRecorded, optRounded, fixedRow);
+            table.Controls.Add(pausePanel);
+
+            table.Controls.Add(SectionLabel("Wohin damit?"));
+            optInsert = Radio("in das aktuelle Makro einfügen (nach dem markierten Schritt)", hasMacro);
+            optReplace = Radio("alle Schritte des aktuellen Makros ersetzen", false);
+            optNew = Radio("als neues Makro anlegen", !hasMacro);
+            optInsert.Enabled = optReplace.Enabled = hasMacro;
+            table.Controls.Add(Group(optInsert, optReplace, optNew));
+
+            preview = new Label { AutoSize = true, ForeColor = SystemColors.GrayText, Margin = new Padding(Ui.S(3), Ui.S(10), Ui.S(3), Ui.S(3)) };
+            table.Controls.Add(preview);
+
+            var buttons = new FlowLayoutPanel { FlowDirection = FlowDirection.RightToLeft, AutoSize = true, Dock = DockStyle.Fill, Margin = new Padding(0, Ui.S(12), 0, 0) };
+            var cancel = new Button { Text = "Verwerfen", DialogResult = DialogResult.Cancel, AutoSize = true, MinimumSize = new Size(Ui.S(90), 0) };
+            var ok = new Button { Text = "Übernehmen", AutoSize = true, MinimumSize = new Size(Ui.S(90), 0) };
+            ok.Click += (s, e) => Accept();
+            buttons.Controls.Add(cancel);
+            buttons.Controls.Add(ok);
+            table.Controls.Add(buttons);
+            AcceptButton = ok;
+            CancelButton = cancel;
+
+            // „alle gleich lang“ steckt in einer eigenen Zeile – die drei Optionen daher von Hand gruppieren.
+            var pauseOptions = new[] { optAsRecorded, optRounded, optFixed };
+            foreach (var radio in pauseOptions)
+            {
+                var self = radio;
+                self.CheckedChanged += (s, e) =>
+                {
+                    if (!self.Checked) return;
+                    foreach (var other in pauseOptions)
+                        if (other != self)
+                            other.Checked = false;
+                    UpdatePreview();
+                };
+            }
+            fixedMs.ValueChanged += (s, e) => { optFixed.Checked = true; UpdatePreview(); };
+            UpdatePreview();
+
+            Controls.Add(table);
+            var size = table.GetPreferredSize(Size.Empty);
+            ClientSize = new Size(size.Width + 2 * margin, size.Height + 2 * margin);
+        }
+
+        static Label SectionLabel(string text)
+        {
+            return new Label { Text = text, AutoSize = true, Margin = new Padding(Ui.S(3), Ui.S(6), Ui.S(3), Ui.S(2)) };
+        }
+
+        static RadioButton Radio(string text, bool isChecked)
+        {
+            return new RadioButton { Text = text, AutoSize = true, Checked = isChecked, Anchor = AnchorStyles.Left };
+        }
+
+        // Jede Gruppe in ein eigenes Panel, damit die Optionsfelder unabhängig voneinander sind.
+        static Control Group(params Control[] controls)
+        {
+            var panel = new FlowLayoutPanel
+            {
+                FlowDirection = FlowDirection.TopDown,
+                AutoSize = true,
+                WrapContents = false,
+                Margin = new Padding(Ui.S(16), 0, Ui.S(3), 0)
+            };
+            panel.Controls.AddRange(controls);
+            return panel;
+        }
+
+        PauseMode SelectedPauses
+        {
+            get { return optRounded.Checked ? PauseMode.Rounded : optFixed.Checked ? PauseMode.Fixed : PauseMode.AsRecorded; }
+        }
+
+        List<Step> BuildSteps()
+        {
+            return RecordConverter.ToSteps(events, SelectedPauses, (int)fixedMs.Value);
+        }
+
+        void UpdatePreview()
+        {
+            var steps = BuildSteps();
+            int duration = steps.Sum(s => MacroCompiler.StepDuration(s));
+            preview.Text = "Ergibt " + steps.Count + " Schritte, ein Durchlauf dauert ca. " + Texts.Duration(duration) + ".";
+        }
+
+        void Accept()
+        {
+            Result = BuildSteps();
+            Target = optReplace.Checked ? RecordTarget.Replace : optNew.Checked ? RecordTarget.NewMacro : RecordTarget.Insert;
+            DialogResult = DialogResult.OK;
         }
     }
 
